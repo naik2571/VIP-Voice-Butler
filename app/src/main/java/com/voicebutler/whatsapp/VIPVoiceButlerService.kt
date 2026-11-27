@@ -70,7 +70,8 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
         super.onCreate()
         settings = ButlerSettings(this)
         tts = TextToSpeech(this, this)
-        initSpeechRecognizerOnMainThread()
+        // NOTE: SpeechRecognizer is NOT initialized in onCreate() to prevent idle battery drain.
+        // It is only spawned on-demand for 6 seconds when a VIP message arrives and prompts for voice reply.
 
         val filter = IntentFilter().apply {
             addAction(ACTION_STOP_BUTLER)
@@ -86,7 +87,7 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
         if (settings.isButlerActive) {
             showStatusNotification()
         }
-        Log.d(TAG, "VIPVoiceButlerService created")
+        Log.d(TAG, "VIPVoiceButlerService created (100% dormant idle state)")
     }
 
     override fun onListenerConnected() {
@@ -105,6 +106,7 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         isServiceConnected = false
+        cleanUpSpeechRecognizer()
         notificationManager.cancel(NOTIFICATION_ID)
         Log.d(TAG, "Notification Listener disconnected")
     }
@@ -112,12 +114,21 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
     private fun pauseButler() {
         settings.isButlerActive = false
         isButlerPaused = true
+        mainHandler.removeCallbacksAndMessages(null)
         tts?.stop()
-        speechRecognizer?.cancel()
         abandonAudioFocus()
-        showStatusNotification()
-        Toast.makeText(this, "VIP Voice Butler Stopped", Toast.LENGTH_SHORT).show()
-        Log.d(TAG, "Butler paused via notification stop button")
+        cleanUpSpeechRecognizer()
+        notificationManager.cancel(NOTIFICATION_ID)
+        Toast.makeText(this, "VIP Voice Butler Stopped (0% Battery)", Toast.LENGTH_SHORT).show()
+        Log.d(TAG, "Butler fully stopped and dormant via notification stop button")
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                requestUnbind()
+            } catch (e: Exception) {
+                Log.w(TAG, "requestUnbind: ${e.message}")
+            }
+        }
     }
 
     private fun resumeButler() {
@@ -143,6 +154,11 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
     }
 
     private fun showStatusNotification() {
+        if (isButlerPaused) {
+            notificationManager.cancel(NOTIFICATION_ID)
+            return
+        }
+
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -150,28 +166,18 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
             this, 0, openAppIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val stopIntent = Intent(ACTION_STOP_BUTLER).apply { setPackage(packageName) }
+        val stopPending = PendingIntent.getBroadcast(
+            this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(openPending)
-            .setOngoing(!isButlerPaused)
-
-        if (isButlerPaused) {
-            val resumeIntent = Intent(ACTION_RESUME_BUTLER).apply { setPackage(packageName) }
-            val resumePending = PendingIntent.getBroadcast(
-                this, 2, resumeIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.setContentTitle("VIP Voice Butler: Stopped")
-                .setContentText("All functions halted. Tap Resume to activate.")
-                .addAction(android.R.drawable.ic_media_play, "▶ RESUME", resumePending)
-        } else {
-            val stopIntent = Intent(ACTION_STOP_BUTLER).apply { setPackage(packageName) }
-            val stopPending = PendingIntent.getBroadcast(
-                this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.setContentTitle("VIP Voice Butler: Active")
-                .setContentText("Monitoring VIP messages. Tap Stop to shut off.")
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "🛑 STOP BUTLER", stopPending)
-        }
+            .setOngoing(true)
+            .setContentTitle("VIP Voice Butler: Active")
+            .setContentText("Monitoring VIP messages. Tap Stop to shut off.")
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "🛑 STOP BUTLER", stopPending)
 
         notificationManager.notify(NOTIFICATION_ID, builder.build())
     }
@@ -210,19 +216,16 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
         val notification = sbn.notification ?: return
         val extras = notification.extras ?: return
 
-        // Extract sender and message body
         val title = extras.getString(Notification.EXTRA_TITLE) ?: ""
         val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
 
         if (title.isBlank() || text.isBlank()) return
 
-        // Check headphone restriction if enabled
         if (settings.isHeadphonesOnly && !isHeadsetConnected()) {
             Log.d(TAG, "Skipping readout: headphones-only mode is active and no headset detected")
             return
         }
 
-        // Check VIP whitelist or read-all setting
         val isVip = isSenderVip(title)
         if (!settings.isReadAllContacts && !isVip) {
             Log.d(TAG, "Skipping message from '$title' (not in VIP list)")
@@ -256,13 +259,11 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
         val titleLast10 = if (normalizedTitleDigits.length >= 10) normalizedTitleDigits.takeLast(10) else normalizedTitleDigits
 
         for (vip in vips) {
-            // 1. Direct name / substring match
             if (title.contains(vip, ignoreCase = true) || vip.contains(title, ignoreCase = true)) {
                 Log.i(TAG, "VIP matched by contact name: '$title' matches '$vip'")
                 return true
             }
 
-            // 2. Normalized 10-digit phone number match (handles +91, spaces, hyphens)
             val normalizedVipDigits = vip.filter { it.isDigit() }
             if (normalizedVipDigits.isNotEmpty()) {
                 val vipLast10 = if (normalizedVipDigits.length >= 10) normalizedVipDigits.takeLast(10) else normalizedVipDigits
@@ -283,10 +284,12 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
         Log.i(TAG, "Speaking: $text")
     }
 
-    private fun initSpeechRecognizerOnMainThread() {
+    private fun startVoiceReplyCapture() {
+        if (isButlerPaused || !settings.isButlerActive) return
+
         mainHandler.post {
             try {
-                speechRecognizer?.destroy()
+                cleanUpSpeechRecognizer()
                 if (SpeechRecognizer.isRecognitionAvailable(this)) {
                     speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
                         setRecognitionListener(object : RecognitionListener {
@@ -301,11 +304,12 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
                                     val reply = matches[0]
                                     handleSpokenReply(reply)
                                 }
+                                cleanUpSpeechRecognizer()
                             }
 
                             override fun onError(error: Int) {
-                                Log.w(TAG, "Speech recognition error: $error. Re-initializing engine.")
-                                mainHandler.postDelayed({ initSpeechRecognizerOnMainThread() }, 800L)
+                                Log.w(TAG, "Voice reply timed out or error ($error). Cleanly closing microphone.")
+                                cleanUpSpeechRecognizer()
                             }
 
                             override fun onBeginningOfSpeech() {}
@@ -315,27 +319,28 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
                             override fun onPartialResults(partialResults: Bundle?) {}
                             override fun onEvent(eventType: Int, params: Bundle?) {}
                         })
+
+                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Say reply for $activeSenderName")
+                        }
+                        startListening(intent)
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error initializing SpeechRecognizer: ${e.message}")
+                Log.e(TAG, "Error starting voice capture: ${e.message}")
+                cleanUpSpeechRecognizer()
             }
         }
     }
 
-    private fun startVoiceReplyCapture() {
-        if (isButlerPaused) return
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Say reply for $activeSenderName")
-        }
+    private fun cleanUpSpeechRecognizer() {
         try {
-            speechRecognizer?.startListening(intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error starting voice capture: ${e.message}")
-            initSpeechRecognizerOnMainThread()
-        }
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
     }
 
     private fun handleSpokenReply(spokenText: String) {
@@ -391,12 +396,14 @@ class VIPVoiceButlerService : NotificationListenerService(), TextToSpeech.OnInit
 
     override fun onDestroy() {
         super.onDestroy()
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             unregisterReceiver(controlReceiver)
         } catch (_: Exception) {}
         notificationManager.cancel(NOTIFICATION_ID)
         tts?.stop()
         tts?.shutdown()
-        speechRecognizer?.destroy()
+        cleanUpSpeechRecognizer()
+        Log.d(TAG, "VIPVoiceButlerService destroyed")
     }
 }
